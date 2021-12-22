@@ -63,6 +63,10 @@ static void *ngx_openssl_create_conf(ngx_cycle_t *cycle);
 static char *ngx_openssl_engine(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_openssl_exit(ngx_cycle_t *cycle);
 
+static void ngx_ssl_handshake_async_handler(ngx_event_t * aev);
+static void ngx_ssl_read_async_handler(ngx_event_t * aev);
+static void ngx_ssl_write_async_handler(ngx_event_t * aev);
+static void ngx_ssl_shutdown_async_handler(ngx_event_t *aev);
 
 static ngx_command_t  ngx_openssl_commands[] = {
 
@@ -106,6 +110,15 @@ int  ngx_ssl_session_cache_index;
 int  ngx_ssl_session_ticket_keys_index;
 int  ngx_ssl_certificate_index;
 int  ngx_ssl_stapling_index;
+
+
+static void
+ngx_ssl_empty_handler(ngx_event_t *aev)
+{
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, aev->log, 0, "ssl empty handler");
+
+    return;
+}
 
 
 ngx_int_t
@@ -299,6 +312,10 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 #ifdef SSL_MODE_NO_AUTO_CHAIN
     SSL_CTX_set_mode(ssl->ctx, SSL_MODE_NO_AUTO_CHAIN);
 #endif
+
+    if(ssl->asynch) {
+        SSL_CTX_set_mode(ssl->ctx, SSL_MODE_ASYNC);
+    }
 
     SSL_CTX_set_read_ahead(ssl->ctx, 1);
 
@@ -1095,6 +1112,7 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
     }
 
     c->ssl = sc;
+    c->asynch = ssl->asynch;
 
     return NGX_OK;
 }
@@ -1113,6 +1131,78 @@ ngx_ssl_set_session(ngx_connection_t *c, ngx_ssl_session_t *session)
     return NGX_OK;
 }
 
+ngx_int_t
+ngx_ssl_async_process_fds(ngx_connection_t *c)
+{
+    OSSL_ASYNC_FD *add_fds = NULL;
+    OSSL_ASYNC_FD *del_fds = NULL;
+    size_t        num_add_fds = 0;
+    size_t        num_del_fds = 0;
+    unsigned      loop = 0;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "ngx_ssl_async_process_fds called");
+
+    if (!ngx_del_async_conn || !ngx_add_async_conn) {
+        ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
+                      "Async notifications not supported");
+        return 0;
+    }
+
+    SSL_get_changed_async_fds(c->ssl->connection, NULL, &num_add_fds,
+                              NULL, &num_del_fds);
+
+    if (num_add_fds) {
+        add_fds = ngx_alloc(num_add_fds * sizeof(OSSL_ASYNC_FD), c->log);
+        if (add_fds == NULL) {
+            ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
+                          "Memory Allocation Error");
+            return 0;
+        }
+    }
+
+    if (num_del_fds) {
+        del_fds = ngx_alloc(num_del_fds * sizeof(OSSL_ASYNC_FD), c->log);
+        if (del_fds == NULL) {
+            ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
+                          "Memory Allocation Error");
+            if (add_fds)
+                ngx_free(add_fds);
+            return 0;
+        }
+    }
+
+    SSL_get_changed_async_fds(c->ssl->connection, add_fds, &num_add_fds,
+                              del_fds, &num_del_fds);
+
+    if (num_del_fds) {
+        for (loop = 0; loop < num_del_fds; loop++) {
+            c->async_fd = del_fds[loop];
+            if (c->num_async_fds) {
+                ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0, "%s: deleting fd = %d", __func__, c->async_fd);
+                ngx_del_async_conn(c, NGX_DISABLE_EVENT);
+                c->num_async_fds--;
+            }
+        }
+    }
+    if (num_add_fds) {
+        for (loop = 0; loop < num_add_fds; loop++) {
+            if (c->num_async_fds == 0) {
+                c->num_async_fds++;
+                c->async_fd = add_fds[loop];
+                ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0, "%s: adding fd = %d", __func__, c->async_fd);
+                ngx_add_async_conn(c);
+            }
+        }
+    }
+
+    if (add_fds)
+        ngx_free(add_fds);
+    if (del_fds)
+        ngx_free(del_fds);
+
+    return 1;
+}
 
 ngx_int_t
 ngx_ssl_handshake(ngx_connection_t *c)
@@ -1127,6 +1217,10 @@ ngx_ssl_handshake(ngx_connection_t *c)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_do_handshake: %d", n);
 
     if (n == 1) {
+
+        if(c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
 
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
             return NGX_ERROR;
@@ -1209,6 +1303,10 @@ ngx_ssl_handshake(ngx_connection_t *c)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_get_error: %d", sslerr);
 
     if (sslerr == SSL_ERROR_WANT_READ) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
+
         c->read->ready = 0;
         c->read->handler = ngx_ssl_handshake_handler;
         c->write->handler = ngx_ssl_handshake_handler;
@@ -1225,6 +1323,9 @@ ngx_ssl_handshake(ngx_connection_t *c)
     }
 
     if (sslerr == SSL_ERROR_WANT_WRITE) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         c->write->ready = 0;
         c->read->handler = ngx_ssl_handshake_handler;
         c->write->handler = ngx_ssl_handshake_handler;
@@ -1234,6 +1335,22 @@ ngx_ssl_handshake(ngx_connection_t *c)
         }
 
         if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+
+    if (c->asynch && sslerr == SSL_ERROR_WANT_ASYNC)
+    {
+        c->async->handler = ngx_ssl_handshake_async_handler;
+        c->read->saved_handler = c->read->handler;
+        c->read->handler = ngx_ssl_empty_handler;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL ASYNC WANT recieved: \"%s\"", __func__);
+
+        if (ngx_ssl_async_process_fds(c) == 0) {
             return NGX_ERROR;
         }
 
@@ -1262,6 +1379,28 @@ ngx_ssl_handshake(ngx_connection_t *c)
 
 
 static void
+ngx_ssl_handshake_async_handler(ngx_event_t *aev)
+{
+    ngx_connection_t  *c;
+
+    c = aev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL handshake async handler");
+
+    aev->ready = 0;
+    aev->handler = ngx_ssl_empty_handler;
+    c->read->handler = c->read->saved_handler;
+
+    if (ngx_ssl_handshake(c) == NGX_AGAIN) {
+        return;
+    }
+
+    c->ssl->handler(c);
+}
+
+
+static void
 ngx_ssl_handshake_handler(ngx_event_t *ev)
 {
     ngx_connection_t  *c;
@@ -1280,6 +1419,11 @@ ngx_ssl_handshake_handler(ngx_event_t *ev)
         return;
     }
 
+    /*
+     * empty the handler of async event to avoid
+     * going back to previous ssl handshake state
+     */
+    c->async->handler = ngx_ssl_empty_handler;
     c->ssl->handler(c);
 }
 
@@ -1451,6 +1595,10 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
 
     if (n > 0) {
 
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
+
         if (c->ssl->saved_write_handler) {
 
             c->write->handler = c->ssl->saved_write_handler;
@@ -1474,6 +1622,9 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_get_error: %d", sslerr);
 
     if (sslerr == SSL_ERROR_WANT_READ) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         c->read->ready = 0;
         return NGX_AGAIN;
     }
@@ -1482,6 +1633,10 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
 
         ngx_log_error(NGX_LOG_INFO, c->log, 0,
                       "peer started SSL renegotiation");
+
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
 
         c->write->ready = 0;
 
@@ -1501,6 +1656,21 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
         return NGX_AGAIN;
     }
 
+    if (c->asynch && sslerr == SSL_ERROR_WANT_ASYNC) {
+        c->async->handler = ngx_ssl_read_async_handler;
+        c->read->saved_handler = c->read->handler;
+        c->read->handler = ngx_ssl_empty_handler;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL ASYNC WANT recieved: \"%s\"", __func__);
+
+        if (ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+
     c->ssl->no_wait_shutdown = 1;
     c->ssl->no_send_shutdown = 1;
 
@@ -1513,6 +1683,24 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
     ngx_ssl_connection_error(c, sslerr, err, "SSL_read() failed");
 
     return NGX_ERROR;
+}
+
+
+static void
+ngx_ssl_read_async_handler(ngx_event_t *aev)
+{
+    ngx_connection_t  *c;
+
+    c = aev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL read async handler");
+
+    aev->ready = 0;
+    aev->handler = ngx_ssl_empty_handler;
+    c->read->handler = c->read->saved_handler;
+
+    c->read->handler(c->read);
 }
 
 
@@ -1706,6 +1894,10 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
 
     if (n > 0) {
 
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
+
         if (c->ssl->saved_read_handler) {
 
             c->read->handler = c->ssl->saved_read_handler;
@@ -1731,6 +1923,9 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_get_error: %d", sslerr);
 
     if (sslerr == SSL_ERROR_WANT_WRITE) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         c->write->ready = 0;
         return NGX_AGAIN;
     }
@@ -1740,6 +1935,9 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
         ngx_log_error(NGX_LOG_INFO, c->log, 0,
                       "peer started SSL renegotiation");
 
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         c->read->ready = 0;
 
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
@@ -1759,6 +1957,21 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
         return NGX_AGAIN;
     }
 
+    if(c->asynch && sslerr == SSL_ERROR_WANT_ASYNC) {
+        c->async->handler = ngx_ssl_write_async_handler;
+        c->read->saved_handler = c->read->handler;
+        c->read->handler = ngx_ssl_empty_handler;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL ASYNC WANT recieved: \"%s\"", __func__);
+
+        if (ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+
     c->ssl->no_wait_shutdown = 1;
     c->ssl->no_send_shutdown = 1;
     c->write->error = 1;
@@ -1766,6 +1979,24 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
     ngx_ssl_connection_error(c, sslerr, err, "SSL_write() failed");
 
     return NGX_ERROR;
+}
+
+
+static void
+ngx_ssl_write_async_handler(ngx_event_t *aev)
+{
+    ngx_connection_t  *c;
+
+    c = aev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL write async handler");
+
+    aev->ready = 0;
+    aev->handler = ngx_ssl_empty_handler;
+    c->read->handler = c->read->saved_handler;
+
+    c->write->handler(c->write);
 }
 
 
@@ -1797,12 +2028,38 @@ ngx_ssl_shutdown(ngx_connection_t *c)
     int        n, sslerr, mode;
     ngx_err_t  err;
 
+    if(!c->ssl) {
+        return NGX_OK;
+    }
+
     if (SSL_in_init(c->ssl->connection)) {
         /*
          * OpenSSL 1.0.2f complains if SSL_shutdown() is called during
          * an SSL handshake, while previous versions always return 0.
          * Avoid calling SSL_shutdown() if handshake wasn't completed.
          */
+
+        if(c->asynch) {
+            /* Check if there is inflight request */
+            if (SSL_want_async(c->ssl->connection) && !c->timedout) {
+                c->async->handler = ngx_ssl_shutdown_async_handler;
+                ngx_ssl_async_process_fds(c);
+                ngx_add_timer(c->async, 300);
+                return NGX_AGAIN;
+            }
+
+            /* Ignore errors from ngx_ssl_async_process_fds as
+               we want to carry on and close the SSL connection
+               anyway. */
+            ngx_ssl_async_process_fds(c);
+            if (ngx_del_async_conn) {
+                if (c->num_async_fds) {
+                    ngx_del_async_conn(c, NGX_DISABLE_EVENT);
+                    c->num_async_fds--;
+                }
+            }
+            ngx_del_conn(c, NGX_DISABLE_EVENT);
+        }
 
         SSL_free(c->ssl->connection);
         c->ssl = NULL;
@@ -1843,13 +2100,34 @@ ngx_ssl_shutdown(ngx_connection_t *c)
     /* before 0.9.8m SSL_shutdown() returned 0 instead of -1 on errors */
 
     if (n != 1 && ERR_peek_error()) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         sslerr = SSL_get_error(c->ssl->connection, n);
 
         ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
                        "SSL_get_error: %d", sslerr);
     }
+    else if (c->asynch && n == -1) {
+        sslerr = SSL_get_error(c->ssl->connection, n);
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_get_error async: %d", sslerr);
+    }
 
     if (n == 1 || sslerr == 0 || sslerr == SSL_ERROR_ZERO_RETURN) {
+        if(c->asynch) {
+            /* Ignore errors from ngx_ssl_async_process_fds as
+               we want to carry on and close the SSL connection
+               anyway. */
+            ngx_ssl_async_process_fds(c);
+            if (ngx_del_async_conn) {
+                if (c->num_async_fds) {
+                    ngx_del_async_conn(c, NGX_DISABLE_EVENT);
+                    c->num_async_fds--;
+                }
+            }
+            ngx_del_conn(c, NGX_DISABLE_EVENT);
+        }
         SSL_free(c->ssl->connection);
         c->ssl = NULL;
 
@@ -1857,8 +2135,15 @@ ngx_ssl_shutdown(ngx_connection_t *c)
     }
 
     if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+        if (c->asynch && ngx_ssl_async_process_fds(c) == 0) {
+            return NGX_ERROR;
+        }
         c->read->handler = ngx_ssl_shutdown_handler;
         c->write->handler = ngx_ssl_shutdown_handler;
+
+        //Work around: Readd write event on shutdown;
+        c->write->ready = 0;
+        c->write->active = 0;
 
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
             return NGX_ERROR;
@@ -1872,9 +2157,41 @@ ngx_ssl_shutdown(ngx_connection_t *c)
             ngx_add_timer(c->read, 30000);
         }
 
+        if (sslerr == SSL_ERROR_WANT_WRITE) {
+            ngx_add_timer(c->write, 10000);
+        }
+
         return NGX_AGAIN;
     }
 
+    if(c->asynch) {
+        if (sslerr == SSL_ERROR_WANT_ASYNC) {
+            c->async->handler = ngx_ssl_shutdown_async_handler;
+            c->read->saved_handler = ngx_ssl_shutdown_handler;
+            c->read->handler = ngx_ssl_empty_handler;
+            c->write->handler = ngx_ssl_shutdown_handler;
+
+            ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "SSL ASYNC WANT recieved: \"%s\"", __func__);
+
+            /* Ignore errors from ngx_ssl_async_process_fds as
+               we want to carry on anyway */
+            ngx_ssl_async_process_fds(c);
+            return NGX_AGAIN;
+        }
+
+        /* Ignore errors from ngx_ssl_async_process_fds as
+           we want to carry on and close the SSL connection
+           anyway. */
+        ngx_ssl_async_process_fds(c);
+        if (ngx_del_async_conn) {
+            if (c->num_async_fds) {
+                ngx_del_async_conn(c, NGX_DISABLE_EVENT);
+                c->num_async_fds--;
+            }
+        }
+        ngx_del_conn(c, NGX_DISABLE_EVENT);
+    }
     err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
     ngx_ssl_connection_error(c, sslerr, err, "SSL_shutdown() failed");
@@ -1883,6 +2200,34 @@ ngx_ssl_shutdown(ngx_connection_t *c)
     c->ssl = NULL;
 
     return NGX_ERROR;
+}
+
+
+static void
+ngx_ssl_shutdown_async_handler(ngx_event_t *aev)
+{
+    ngx_connection_t           *c;
+    ngx_connection_handler_pt   handler;
+
+    c = aev->data;
+    handler = c->ssl->handler;
+
+    if (aev->timedout) {
+        c->timedout = 1;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, aev->log, 0,
+                   "SSL shutdown async handler");
+
+    aev->ready = 0;
+    aev->handler = ngx_ssl_empty_handler;
+    c->read->handler = c->read->saved_handler;
+
+    if (ngx_ssl_shutdown(c) == NGX_AGAIN) {
+        return;
+    }
+
+    handler(c);
 }
 
 
@@ -1905,6 +2250,11 @@ ngx_ssl_shutdown_handler(ngx_event_t *ev)
         return;
     }
 
+    /*
+     * empty the handler of async event to avoid
+     * going back to previous ssl shutdown state
+     */
+    c->async->handler = ngx_ssl_empty_handler;
     handler(c);
 }
 
@@ -3544,6 +3894,10 @@ ngx_openssl_engine(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     oscf->engine = 1;
+
+    if(cf->no_ssl_init) {
+        return NGX_CONF_OK;
+    }
 
     value = cf->args->elts;
 
